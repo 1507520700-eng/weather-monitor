@@ -24,6 +24,7 @@ def main():
         "pyinstaller",
         "--noconfirm",
         "--clean",
+        "--onefile",             # 单文件模式: 只产出一个 exe
         "--windowed",
         "--name", "WeatherMonitor",
         "--add-data", os.path.join(SRC, "china_cities.json") + ";.",
