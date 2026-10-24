@@ -1,0 +1,18 @@
+﻿python : C:\Users\Administrator\weather-monitor\push_to_github.py:11: DeprecationWarning: Argument login_or_token is de
+precated, please use auth=github.Auth.Token(...) instead
+所在位置 行:1 字符: 1
++ python "C:\Users\Administrator\weather-monitor\push_to_github.py" > " ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\Admini...en(...) instead:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  g = Github(TOKEN)
+目标仓库: 1507520700-eng/weather-monitor 分支: main
+待上传文件:
+   build_exe.py
+   push_log.txt
+   requirements.txt
+   src/china_cities.json
+   src/history_store.py
+   src/locator.py
+   src/main.py
