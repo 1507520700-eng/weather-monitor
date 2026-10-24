@@ -111,7 +111,8 @@ def get_realtime_weather(city_code):
     """
     url = f"https://d1.weather.com.cn/sk_2d/{city_code}.html"
     resp = _get(url, referer="https://www.weather.com.cn/")
-    text = resp.text
+    # 接口实际返回 UTF-8; 显式按 UTF-8 解码, 避免 requests 误判为 latin-1 导致中文乱码
+    text = resp.content.decode("utf-8", errors="replace")
     # 定位 dataSK= 后的第一个 '{'，做括号配平提取完整 JSON 对象
     start = text.find("dataSK=")
     if start < 0:
@@ -136,7 +137,7 @@ def get_realtime_weather(city_code):
         "weather": data.get("weather", ""),     # 天气现象
         "wind_dir": data.get("WD", ""),         # 风向
         "wind_level": data.get("WS", ""),       # 风力等级
-        "wind_speed": data.get("wse", ""),      # 风速 (km/h)
+        "wind_speed": _num(re.sub(r"[^0-9.+-]", "", data.get("wse", "") or "")),  # 风速 km/h -> 数字
         "humidity": _num(data.get("SD", "").replace("%", "")),  # 相对湿度 %
         "pressure": _num(data.get("qy", "")),   # 气压 hPa
         "rain": _num(data.get("rain", "")),     # 当前降雨 (mm)
@@ -206,6 +207,42 @@ def get_satellite_image():
                f"SEVP_NSMC_WXBL_FY2G_EVL_ACHN_LNO_PY_{ts_str}.JPG")
     img_resp = _get(img_url, referer=page_url)
     return img_resp.content, dt
+
+
+def get_satellite_frames(max_hours=12):
+    """
+    获取卫星云图最近 N 小时的历史帧序列 (逐小时, 用于动态播放)
+    返回: [{"data": bytes, "dt": datetime}, ...] 最新在前, 已去重
+    """
+    page_url = "https://www.nmc.cn/publish/satellite/fy2c-disc-vis.html"
+    resp = _get(page_url)
+    ts_list = re.findall(r'product/(20\d{2}/\d{1,2}/\d{1,2}/WXBL/medium/'
+                         r'SEVP_NSMC_WXBL_FY2G_EVL_ACHN_LNO_PY_(\d{17})\.JPG)', resp.text)
+    if not ts_list:
+        raise RuntimeError("云图时间戳解析失败")
+
+    frames = []
+    seen = set()
+    for date_part, ts_str in ts_list:
+        if ts_str in seen:
+            continue
+        seen.add(ts_str)
+        ts_base = ts_str[:14]
+        try:
+            dt = datetime.strptime(ts_base, "%Y%m%d%H%M%S")
+        except ValueError:
+            continue
+        img_url = ("https://image.nmc.cn/product/"
+                   f"{date_part}/WXBL/medium/"
+                   f"SEVP_NSMC_WXBL_FY2G_EVL_ACHN_LNO_PY_{ts_str}.JPG")
+        try:
+            img_resp = _get(img_url, referer=page_url)
+            frames.append({"data": img_resp.content, "dt": dt})
+        except Exception:
+            continue
+        if len(frames) >= max_hours:
+            break
+    return frames
 
 
 # ---------- 区域降雨判断 (基于雷达回波+实时天气) ----------
