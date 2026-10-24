@@ -23,7 +23,7 @@ try:
         QLabel, QComboBox, QPushButton, QFrame, QGridLayout,
         QMessageBox
     )
-    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+    from PyQt6.QtCore import Qt, QTimer, QThread, QRect, pyqtSignal
     from PyQt6.QtGui import QPixmap, QImage, QIcon, QPainter, QColor
     HAS_QT = True
 except Exception:
@@ -36,46 +36,22 @@ import locator
 
 
 # ================================================================
-# 后台抓取线程
+# 数据获取 (主线程同步执行, 避免 QThread 竞态崩溃)
 # ================================================================
-class FetchWorker(QThread):
-    """后台线程: 抓取实时天气, 不阻塞界面"""
-    result_ready = pyqtSignal(dict)
-    error = pyqtSignal(str)
-
-    def __init__(self, city_code, city_name, parent=None):
-        super().__init__(parent)
-        self.city_code = city_code
-        self.city_name = city_name
-
-    def run(self):
-        try:
-            w = wd.get_realtime_weather(self.city_code)
-            w["_city_name"] = self.city_name
-            w["_city_code"] = self.city_code
-            self.result_ready.emit(w)
-        except Exception as e:
-            self.error.emit(str(e))
+def fetch_weather(city_code, city_name):
+    """同步抓取实时天气, 返回 dict (含城市名/代码)"""
+    w = wd.get_realtime_weather(city_code)
+    w["_city_name"] = city_name
+    w["_city_code"] = city_code
+    return w
 
 
-class ImageWorker(QThread):
-    """后台线程: 抓取雷达/云图"""
-    image_ready = pyqtSignal(str, bytes, object)  # type, bytes, dt
-    error = pyqtSignal(str)
-
-    def __init__(self, img_type, parent=None):
-        super().__init__(parent)
-        self.img_type = img_type  # "radar" or "satellite"
-
-    def run(self):
-        try:
-            if self.img_type == "radar":
-                data, dt = wd.get_radar_image()
-            else:
-                data, dt = wd.get_satellite_image()
-            self.image_ready.emit(self.img_type, data, dt)
-        except Exception as e:
-            self.error.emit(str(e))
+def fetch_image(img_type):
+    """同步抓取雷达/云图, 返回 (data_bytes, dt)"""
+    if img_type == "radar":
+        return wd.get_radar_image()
+    else:
+        return wd.get_satellite_image()
 
 
 # ================================================================
@@ -161,11 +137,11 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.refresh_all)
         self.timer.start(self.REFRESH_SECONDS * 1000)
 
-        # 启动自动定位 (后台)
+        # 启动自动定位 (首次运行时询问授权)
         self._auto_locate()
 
-        # 首次加载
-        self.refresh_all()
+        # 首次加载: 延迟到窗口显示后, 避免控件未就绪时同步抓取导致崩溃
+        QTimer.singleShot(200, self.refresh_all)
 
     # ---------- 界面构建 ----------
     def _build_ui(self):
@@ -190,6 +166,10 @@ class MainWindow(QMainWindow):
         self.locate_btn = QPushButton("自动定位")
         self.locate_btn.clicked.connect(self.on_auto_locate_click)
         top.addWidget(self.locate_btn)
+
+        self.select_btn = QPushButton("选择地区")
+        self.select_btn.clicked.connect(self._open_region_select)
+        top.addWidget(self.select_btn)
 
         self.refresh_btn = QPushButton("立即刷新")
         self.refresh_btn.clicked.connect(self.refresh_all)
@@ -220,8 +200,11 @@ class MainWindow(QMainWindow):
         self.btn_radar.clicked.connect(lambda: self._set_image_mode("radar"))
         self.btn_sat = QPushButton("卫星云图")
         self.btn_sat.clicked.connect(lambda: self._set_image_mode("satellite"))
+        self.anim_btn = QPushButton("▶ 播放动画")
+        self.anim_btn.clicked.connect(self._toggle_anim)
         img_btn_row.addWidget(self.btn_radar)
         img_btn_row.addWidget(self.btn_sat)
+        img_btn_row.addWidget(self.anim_btn)
         self.image_panel.addLayout(img_btn_row)
         middle.addLayout(self.image_panel, stretch=3)
 
@@ -305,24 +288,86 @@ class MainWindow(QMainWindow):
 
     # ---------- 自动定位 ----------
     def _auto_locate(self):
-        def run():
-            try:
-                loc = locator.locate_by_ip()
-                if loc:
-                    code = locator.match_city_code(
-                        loc.get("city"), loc.get("province"), wd.CITY_FLAT)
-                    if code:
-                        name = next((n for n, c in wd.CITY_FLAT.items() if c == code),
-                                    loc.get("city"))
-                        self._apply_location(name, code)
-            except Exception:
-                pass
-        threading.Thread(target=run, daemon=True).start()
+        # 首次运行: 询问用户是否允许自动定位 (授权)
+        from PyQt6.QtWidgets import QMessageBox
+        # 用一个成员标记避免每次刷新都弹
+        if getattr(self, "_locate_asked", False):
+            return
+        self._locate_asked = True
+        box = QMessageBox(self)
+        box.setWindowTitle("定位授权")
+        box.setText("是否允许程序自动定位到您所在城市？\n"
+                    "(基于网络IP定位, 若定位不准可在顶部点击'选择地区'手动选择)")
+        allow_btn = box.addButton("允许定位", QMessageBox.ButtonRole.AcceptRole)
+        deny_btn = box.addButton("暂不定位", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(allow_btn)
+        box.exec()
+        if box.clickedButton() is not allow_btn:
+            return
+        # 主线程同步定位 (定位请求快, 一次失败静默)
+        try:
+            loc = locator.locate_by_ip()
+            if loc:
+                code = locator.match_city_code(
+                    loc.get("city"), loc.get("province"), wd.CITY_FLAT)
+                if code:
+                    name = next((n for n, c in wd.CITY_FLAT.items() if c == code),
+                                loc.get("city"))
+                    self._apply_location(name, code)
+                else:
+                    self.status_label.setText(f"定位到 {loc.get('city')} 但未匹配城市库, 可手动选择")
+        except Exception:
+            pass
 
     def on_auto_locate_click(self):
         """手动触发定位"""
         self.status_label.setText("正在定位...")
         self._auto_locate()
+
+    def _open_region_select(self):
+        """打开 省-市 选择对话框, 手动精确选地区"""
+        from PyQt6.QtWidgets import QDialog, QComboBox, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("选择地区")
+        dlg.setMinimumWidth(360)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("请选择省份和城市:"))
+
+        # 省下拉 (prov_cities 按 key)
+        prov_combo = QComboBox()
+        provs = list(wd.PROV_CITIES.keys())
+        provs.sort()
+        prov_combo.addItems(provs)
+        lay.addWidget(prov_combo)
+
+        # 市下拉
+        city_combo = QComboBox()
+        lay.addWidget(city_combo)
+
+        def update_cities():
+            city_combo.clear()
+            p = prov_combo.currentText()
+            for c in wd.PROV_CITIES.get(p, []):
+                city_combo.addItem(c)
+        prov_combo.currentTextChanged.connect(lambda _: update_cities())
+        update_cities()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        lay.addWidget(buttons)
+
+        def on_ok():
+            city = city_combo.currentText()
+            if city:
+                code = wd.get_city_code(city)
+                if code:
+                    self._apply_location(city, code)
+                    self.status_label.setText(f"已选择: {city}")
+            dlg.accept()
+        buttons.accepted.connect(on_ok)
+        buttons.rejected.connect(dlg.reject)
+        dlg.exec()
 
     def _apply_location(self, name, code):
         try:
@@ -361,10 +406,11 @@ class MainWindow(QMainWindow):
         if not self.current_code:
             return
         self.status_label.setText("正在获取天气数据...")
-        self.worker = FetchWorker(self.current_code, self.current_city)
-        self.worker.result_ready.connect(self._on_weather)
-        self.worker.error.connect(lambda e: self.status_label.setText(f"天气获取失败: {e}"))
-        self.worker.start()
+        try:
+            data = fetch_weather(self.current_code, self.current_city)
+            self._on_weather(data)
+        except Exception as e:
+            self.status_label.setText("天气获取失败: " + str(e))
 
     def _on_weather(self, data):
         city = data.get("_city_name", self.current_city)
@@ -418,21 +464,46 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    # ---------- 图片加载 ----------
+    # ---------- 图片加载 (云图动态播放) ----------
     def _load_image(self):
         self.image_label.setText("正在加载图片...")
         self.image_label.setStyleSheet(
             "background:#0d0d1a;color:#aaa;border-radius:8px;")
-        self.img_worker = ImageWorker(self.image_mode)
-        self.img_worker.image_ready.connect(self._on_image)
-        self.img_worker.error.connect(
-            lambda e: self.image_label.setText(f"图片获取失败: {e}"))
-        self.img_worker.start()
+        try:
+            data, dt = fetch_image(self.image_mode)
+            self._add_frame(self.image_mode, data, dt)
+            self._show_frame()
+        except Exception as e:
+            self.image_label.setText("图片获取失败: " + str(e))
 
-    def _on_image(self, img_type, data, dt):
+    def _add_frame(self, img_type, data, dt):
+        """把一帧加入动画序列 (自累积)"""
+        if not hasattr(self, "_frame_list"):
+            self._frame_list = []
+        # 去重: 相同时间戳不重复添加
+        key = dt.strftime("%Y%m%d%H%M")
+        if self._frame_list and self._frame_list[-1].get("key") == key:
+            return
+        self._frame_list.append({"key": key, "data": data, "dt": dt})
+        # 最多保留 12 帧 (12小时)
+        if len(self._frame_list) > 12:
+            self._frame_list.pop(0)
+        # 更新动画按钮状态与提示
+        if hasattr(self, "anim_btn"):
+            n = len(self._frame_list)
+            self.anim_btn.setText(f"▶ 播放({n}帧)")
+
+    def _show_frame(self):
+        """显示动画序列当前帧"""
+        if not hasattr(self, "_frame_list") or not self._frame_list:
+            return
+        idx = getattr(self, "_frame_idx", -1)
+        idx = (idx + 1) % len(self._frame_list)
+        self._frame_idx = idx
+        fr = self._frame_list[idx]
         try:
             pix = QPixmap()
-            pix.loadFromData(data)
+            pix.loadFromData(fr["data"])
             w = self.image_label.width() or 600
             h = self.image_label.height() or 360
             self.image_label.setPixmap(
@@ -441,29 +512,67 @@ class MainWindow(QMainWindow):
             self.image_label.setStyleSheet(
                 "background:#0d0d1a;border-radius:8px;")
             self.image_time_label.setText(
-                f"数据时间: {dt.strftime('%Y-%m-%d %H:%M')}  (中央气象台)")
+                f"数据时间: {fr['dt'].strftime('%Y-%m-%d %H:%M')}  (中央气象台)")
         except Exception as e:
-            self.image_label.setText(f"图片显示失败: {e}")
+            self.image_label.setText("图片显示失败: " + str(e))
+
+    def _on_image(self, img_type, data, dt):
+        # 兼容旧调用: 添加并显示
+        self._add_frame(img_type, data, dt)
+        self._show_frame()
+
+    def _toggle_anim(self):
+        """播放/暂停云图动画"""
+        if getattr(self, "_anim_timer", None) and self._anim_timer.isActive():
+            self._anim_timer.stop()
+            self.anim_btn.setText("▶ 播放")
+        else:
+            if not hasattr(self, "_anim_timer"):
+                self._anim_timer = QTimer(self)
+                self._anim_timer.timeout.connect(self._show_frame)
+                self._anim_timer.start(1200)  # 1.2秒切换一帧
+            else:
+                self._anim_timer.start(1200)
+            n = len(getattr(self, "_frame_list", []))
+            self.anim_btn.setText(f"⏸ 暂停({n}帧)")
 
     # ---------- 历史趋势 ----------
     def _update_trend(self):
+        # 趋势信息: 用文本表逐小时展示温度/风力/降雨 (稳定可靠, 不依赖绘图)
         try:
             rows = hs.get_history(self.current_city, hours=24)
-            self.trend_chart.set_data(rows)
-            if rows:
-                temps = [r["temp"] for r in rows if r["temp"] is not None]
-                rains = [r["rain"] for r in rows if r["rain"]]
-                t_now = temps[-1] if temps else "--"
-                info = f"共{len(rows)}条 | 当前温度 {t_now}℃"
-                if rains:
-                    info += f" | 有降雨记录 {len(rains)} 次"
-                else:
-                    info += " | 无降雨"
-                self.trend_info.setText(info)
-            else:
-                self.trend_info.setText("运行10分钟后开始记录, 1小时后可见完整趋势")
+            if not rows:
+                self.trend_info.setText(
+                    "运行10分钟后开始记录, 1小时后可见逐小时趋势")
+                return
+            lines = []
+            temps = [r["temp"] for r in rows if r["temp"] is not None]
+            winds = [r["wind_speed"] for r in rows if r.get("wind_speed") is not None]
+            rains = [r["rain"] for r in rows if r.get("rain")]
+            # 最新一条
+            latest = rows[-1]
+            hm = latest.get("ts", "")[11:16] if latest.get("ts") else ""
+            l_t = latest.get("temp", "--")
+            l_w = latest.get("wind_speed", "--")
+            l_r = latest.get("rain", 0) or 0
+            lines.append(
+                f"最新({hm}): 温度 {l_t}℃ | 风力 {l_w}km/h | 降雨 {l_r}mm")
+            # 近6条逐小时明细
+            lines.append("—— 逐小时明细 ——")
+            for r in rows[-6:]:
+                h = r.get("ts", "")[11:16] if r.get("ts") else "--"
+                t = r.get("temp", "--")
+                w = r.get("wind_speed", "--")
+                rain = r.get("rain", 0) or 0
+                wd_str = r.get("wind_dir", "")
+                wl_str = r.get("wind_level", "")
+                lines.append(
+                    f"{h}  温度{t}℃  风{w}km/h({wd_str}{wl_str})  降雨{rain}mm")
+            self.trend_info.setText("\n".join(lines))
+            # 保留图表组件(不再绘制, 避免渲染崩溃), 显示汇总
+            self.trend_chart.set_data([])
         except Exception as e:
-            self.trend_info.setText(f"趋势加载失败: {e}")
+            self.trend_info.setText("趋势加载失败: " + str(e))
 
 
 # ================================================================
